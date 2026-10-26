@@ -42,6 +42,8 @@ const PALETTE = [
 const COLOR_SETTING = "ZipTies.NewTieColor";
 const COLOR_MODE = { RANDOM: "Random", WIRES: "Match wires", GREY: "Grey" };
 const KEY_SETTING = "ZipTies.Key";
+const ROUTING_SETTING = "ZipTies.WireRouting";
+const GRID_ROUTING = "Rounded grid";
 // Letters ComfyUI does not bind on their own (it binds r w n m a p v h).
 const KEYS = ["Z", "X", "C", "G", "T", "Y"];
 
@@ -58,6 +60,7 @@ const state = {
   rendering: false,
   rendered: false, // set by renderLink, read by the culling fallback
   endpoints: new Map(), // member key -> { a, b, sd, ed, startControl, endControl } from the last frame
+  tieDirection: new Map(), // tie -> travel sign shared by its strands in this frame
   linkColors: new Map(), // member key -> colour the wire was drawn in last frame
   index: new Map(), // member key -> ties[]
   sigs: new Map(), // tied link id -> "origin:slot>target:slot", to follow a wire that is reconnected
@@ -444,7 +447,18 @@ function spacing(canvas) {
   return (canvas.connections_width ?? 3) + 1.5;
 }
 
+function tieAngle(tie) {
+  const angle = tie.angle ?? 0;
+  return setting(ROUTING_SETTING, "Default") === GRID_ROUTING ? Math.round(angle / (Math.PI / 2)) * (Math.PI / 2) : angle;
+}
+
 function tieAxes(tie) {
+  if (setting(ROUTING_SETTING, "Default") === GRID_ROUTING) {
+    const quarter = ((Math.round((tie.angle ?? 0) / (Math.PI / 2)) % 4) + 4) % 4;
+    const axes = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+    const t = axes[quarter];
+    return { t, n: [-t[1], t[0]] };
+  }
   const c = Math.cos(tie.angle ?? 0);
   const s = Math.sin(tie.angle ?? 0);
   return { t: [c, s], n: [-s, c] };
@@ -500,6 +514,231 @@ function offsetByDir(p, dir, d) {
     case DIR.DOWN: return [p[0], p[1] + d];
     default: return [p[0], p[1]];
   }
+}
+
+function gridDirection(dir) {
+  switch (dir) {
+    case DIR.LEFT: return [-1, 0];
+    case DIR.RIGHT: return [1, 0];
+    case DIR.UP: return [0, -1];
+    case DIR.DOWN: return [0, 1];
+    default: return null;
+  }
+}
+
+function addGridPoint(points, p) {
+  const last = points.at(-1);
+  if (last && Math.abs(last[0] - p[0]) < 1e-6 && Math.abs(last[1] - p[1]) < 1e-6) return;
+  const prev = points.at(-2);
+  if (prev && ((prev[0] === last[0] && last[0] === p[0]) || (prev[1] === last[1] && last[1] === p[1]))) {
+    if ((last[0] - prev[0]) * (p[0] - last[0]) + (last[1] - prev[1]) * (p[1] - last[1]) > 0) points.pop();
+  }
+  points.push(p);
+}
+
+/** One orthogonal route through the strand positions. Port and tie tangents set the first and last leg. */
+function gridRoute(canvas, key, seg) {
+  const gridSize = window.LiteGraph?.CANVAS_GRID_SIZE ?? 10;
+  const snap = (value) => Math.round(value / gridSize) * gridSize;
+  const ties = orderedTies(key, seg.a, seg.b);
+  const stops = [
+    { p: seg.a, tangent: gridDirection(seg.sd) },
+    ...ties.map((tie, index) => {
+      let { t, n } = tieAxes(tie);
+      if (t[0] < 0 || t[1] < 0) {
+        t = [-t[0], -t[1]];
+        n = [-n[0], -n[1]];
+      }
+      let direction = state.tieDirection.get(tie);
+      if (direction == null) {
+        const next = ties[index + 1], prev = ties[index - 1];
+        const nextAlong = next ? t[0] * (next.pos[0] - tie.pos[0]) + t[1] * (next.pos[1] - tie.pos[1]) : 0;
+        const prevAlong = prev ? t[0] * (tie.pos[0] - prev.pos[0]) + t[1] * (tie.pos[1] - prev.pos[1]) : 0;
+        direction = Math.sign(nextAlong || prevAlong || t[0] * (seg.b[0] - seg.a[0]) + t[1] * (seg.b[1] - seg.a[1])) || 1;
+        state.tieDirection.set(tie, direction);
+      }
+      if (direction < 0) {
+        t = [-t[0], -t[1]];
+        n = [-n[0], -n[1]];
+      }
+      const lane = (tie.links.indexOf(key) - (tie.links.length - 1) / 2) * spacing(canvas);
+      return { p: [tie.pos[0] + n[0] * lane, tie.pos[1] + n[1] * lane], tangent: t, lane, halfWidth: (tie.links.length - 1) * spacing(canvas) / 2 };
+    }),
+    { p: seg.b, tangent: gridDirection(seg.ed)?.map((v) => -v) },
+  ];
+  const points = [stops[0].p];
+  const lanes = [0], halfWidths = [0];
+  for (let i = 1; i < stops.length; i++) {
+    const a = stops[i - 1], b = stops[i];
+    const lane = a.lane ?? b.lane ?? 0;
+    const halfWidth = Math.max(a.halfWidth ?? 0, b.halfWidth ?? 0);
+    const add = (p) => {
+      addGridPoint(points, p);
+      lanes.length = points.length;
+      halfWidths.length = points.length;
+      lanes[points.length - 1] = lane;
+      halfWidths[points.length - 1] = halfWidth;
+    };
+    const dx = b.p[0] - a.p[0], dy = b.p[1] - a.p[1];
+    const lead = Math.min(18, Math.hypot(dx, dy) / 4);
+    const start = a.tangent ? [a.p[0] + a.tangent[0] * lead, a.p[1] + a.tangent[1] * lead] : a.p;
+    const end = b.tangent ? [b.p[0] - b.tangent[0] * lead, b.p[1] - b.tangent[1] * lead] : b.p;
+    add(start);
+    const horizontal = a.tangent ? Math.abs(a.tangent[0]) > 0.5 : Math.abs(dx) >= Math.abs(dy);
+    const endHorizontal = b.tangent ? Math.abs(b.tangent[0]) > 0.5 : !horizontal;
+    if (horizontal === endHorizontal) {
+      const axis = horizontal ? 0 : 1;
+      const travel = end[axis] - start[axis];
+      const reverse = (a.tangent && travel * a.tangent[axis] <= 0) || (b.tangent && travel * b.tangent[axis] <= 0);
+      if (reverse) {
+        const startSign = a.tangent?.[axis] || Math.sign(travel) || 1;
+        const endSign = b.tangent?.[axis] || Math.sign(travel) || 1;
+        const fromCandidate = snap(start[axis] + startSign * (24 + Math.abs(lane))) + lane;
+        const toCandidate = snap(end[axis] - endSign * (24 + Math.abs(lane))) + lane;
+        let from = (fromCandidate - start[axis]) * startSign > 0 ? fromCandidate : start[axis] + startSign * 24;
+        let to = (end[axis] - toCandidate) * endSign > 0 ? toCandidate : end[axis] - endSign * 24;
+        if (Math.abs(from - to) < 1e-6) to -= endSign * 20;
+        const middleNormal = (horizontal ? 1 : -1) * (Math.sign(to - from) || -startSign);
+        let cross = snap(Math.max(start[1 - axis], end[1 - axis]) + 30 + 2 * Math.abs(lane)) + middleNormal * lane;
+        let outside = null;
+        if (horizontal) {
+          const sourceBox = i === 1 ? seg.sourceBox : null;
+          const targetBox = i === stops.length - 1 ? seg.targetBox : null;
+          const boxes = [sourceBox, targetBox].filter(Boolean);
+          if (boxes.length) {
+            const top = Math.min(start[1], end[1], ...boxes.map((box) => box[1]));
+            const bottom = Math.max(start[1], end[1], ...boxes.map((box) => box[1] + box[3]));
+            const toward = b.p[1] - a.p[1];
+            const up = toward < 0 || (toward === 0 && start[1] - top <= bottom - start[1]);
+            const margin = 24 + Math.abs(lane);
+            const gapStart = up ? targetBox && targetBox[1] + targetBox[3] : sourceBox && sourceBox[1] + sourceBox[3];
+            const gapEnd = up ? sourceBox?.[1] : targetBox?.[1];
+            const clearance = (canvas.connections_width ?? 3) / 2 + 2;
+            const bundleHalf = Math.max(a.halfWidth ?? 0, b.halfWidth ?? 0);
+            if (gapStart != null && gapEnd != null && gapEnd - gapStart > 2 * (clearance + bundleHalf)) {
+              const middle = (gapStart + gapEnd) / 2 + middleNormal * lane;
+              const snapped = snap((gapStart + gapEnd) / 2) + middleNormal * lane;
+              cross = snapped > gapStart + clearance && snapped < gapEnd - clearance ? snapped : middle;
+            } else {
+              cross = snap((up ? top - margin : bottom + margin)) + middleNormal * lane;
+              if (sourceBox && targetBox) {
+                const left = Math.min(sourceBox[0], targetBox[0]);
+                const right = Math.max(sourceBox[0] + sourceBox[2], targetBox[0] + targetBox[2]);
+                outside = { left, right, margin };
+              }
+            }
+          }
+        }
+        const sideNormal = horizontal ? -1 : 1;
+        from += (sideNormal * Math.sign(cross - start[1 - axis]) - 1) * lane;
+        to += (sideNormal * Math.sign(end[1 - axis] - cross) - 1) * lane;
+        if (outside) {
+          if (startSign > 0) from = Math.max(from, snap(outside.right + outside.margin) + lane);
+          else from = Math.min(from, snap(outside.left - outside.margin) + lane);
+          if (endSign > 0) to = Math.min(to, snap(outside.left - outside.margin) + lane);
+          else to = Math.max(to, snap(outside.right + outside.margin) + lane);
+        }
+        if (Math.abs(from - to) < 1e-6) to -= endSign * 20;
+        if (horizontal) {
+          add([from, start[1]]);
+          add([from, cross]);
+          add([to, cross]);
+          add([to, end[1]]);
+        } else {
+          add([start[0], from]);
+          add([cross, from]);
+          add([cross, to]);
+          add([end[0], to]);
+        }
+      } else if (start[0] !== end[0] && start[1] !== end[1]) {
+        const midpoint = (start[axis] + end[axis]) / 2;
+        const middleNormal = horizontal ? -Math.sign(end[1] - start[1]) : Math.sign(end[0] - start[0]);
+        const candidate = snap(midpoint) + middleNormal * lane;
+        const mid = (candidate - start[axis]) * (end[axis] - candidate) > 0 ? candidate : midpoint;
+        if (horizontal) {
+          add([mid, start[1]]);
+          add([mid, end[1]]);
+        } else {
+          add([start[0], mid]);
+          add([end[0], mid]);
+        }
+      }
+    } else {
+      const firstAxis = horizontal ? 0 : 1;
+      const lastAxis = 1 - firstAxis;
+      const firstReverse = a.tangent && (end[firstAxis] - start[firstAxis]) * a.tangent[firstAxis] <= 0;
+      const lastReverse = b.tangent && (end[lastAxis] - start[lastAxis]) * b.tangent[lastAxis] <= 0;
+      if (firstReverse || lastReverse) {
+        const firstSign = a.tangent?.[firstAxis] || 1;
+        const lastSign = b.tangent?.[lastAxis] || 1;
+        const firstCandidate = snap(start[firstAxis] + firstSign * (24 + Math.abs(lane))) + lane;
+        const lastCandidate = snap(end[lastAxis] - lastSign * (24 + Math.abs(lane))) + lane;
+        let first = (firstCandidate - start[firstAxis]) * firstSign > 0 ? firstCandidate : start[firstAxis] + firstSign * 24;
+        let last = (end[lastAxis] - lastCandidate) * lastSign > 0 ? lastCandidate : end[lastAxis] - lastSign * 24;
+        if (Math.abs(first - end[firstAxis]) < 1e-6) first += firstSign * 20;
+        if (Math.abs(last - start[lastAxis]) < 1e-6) last -= lastSign * 20;
+        if (horizontal) {
+          add([first, start[1]]);
+          add([first, last]);
+          add([end[0], last]);
+        } else {
+          add([start[0], first]);
+          add([last, first]);
+          add([last, end[1]]);
+        }
+      } else if (start[0] !== end[0] && start[1] !== end[1]) add(horizontal ? [end[0], start[1]] : [start[0], end[1]]);
+    }
+    add(end);
+    add(b.p);
+  }
+  return { points, lanes, halfWidths };
+}
+
+/** Trace the same quadratic corners for drawing and the Z-drag intersection test. */
+function roundedGridPath(path, route) {
+  const { points, lanes, halfWidths } = route;
+  const polyline = [points[0]];
+  path?.moveTo(...points[0]);
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1], cur = points[i], next = points[i + 1];
+    const before = Math.hypot(cur[0] - prev[0], cur[1] - prev[1]);
+    const after = Math.hypot(next[0] - cur[0], next[1] - cur[1]);
+    const turn = (cur[0] - prev[0]) * (next[1] - cur[1]) - (cur[1] - prev[1]) * (next[0] - cur[0]);
+    if (!turn || !before || !after) {
+      path?.lineTo(...cur);
+      polyline.push(cur);
+      continue;
+    }
+    const radius = Math.min(12 + halfWidths[i] - Math.sign(turn) * lanes[i], before / 2, after / 2);
+    const enter = [cur[0] - (cur[0] - prev[0]) * radius / before, cur[1] - (cur[1] - prev[1]) * radius / before];
+    const leave = [cur[0] + (next[0] - cur[0]) * radius / after, cur[1] + (next[1] - cur[1]) * radius / after];
+    path?.lineTo(...enter);
+    path?.quadraticCurveTo(...cur, ...leave);
+    polyline.push(enter);
+    for (let j = 1; j <= 8; j++) {
+      const t = j / 8, u = 1 - t;
+      polyline.push([u * u * enter[0] + 2 * u * t * cur[0] + t * t * leave[0], u * u * enter[1] + 2 * u * t * cur[1] + t * t * leave[1]]);
+    }
+  }
+  path?.lineTo(...points.at(-1));
+  polyline.push(points.at(-1));
+  return polyline;
+}
+
+function pointOnGrid(polyline, fraction) {
+  let total = 0;
+  for (let i = 1; i < polyline.length; i++) total += Math.hypot(polyline[i][0] - polyline[i - 1][0], polyline[i][1] - polyline[i - 1][1]);
+  let remaining = total * fraction;
+  for (let i = 1; i < polyline.length; i++) {
+    const a = polyline[i - 1], b = polyline[i];
+    const length = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (remaining <= length || i === polyline.length - 1) {
+      const t = length ? remaining / length : 0;
+      return { x: a[0] + (b[0] - a[0]) * t, y: a[1] + (b[1] - a[1]) * t };
+    }
+    remaining -= length;
+  }
+  return { x: polyline[0][0], y: polyline[0][1] };
 }
 
 /** Polyline of one segment, matching the spline the link adapter draws. */
@@ -574,8 +813,9 @@ function strokeTargets(canvas, graph, p, q) {
   const hits = [];
   for (const [key, ep] of state.endpoints) {
     let best = null;
-    for (const seg of route(canvas, key, ep)) {
-      const poly = segmentPolyline(canvas, seg);
+    const grid = setting(ROUTING_SETTING, "Default") === GRID_ROUTING;
+    for (const seg of grid ? [ep] : route(canvas, key, ep)) {
+      const poly = grid ? roundedGridPath(null, gridRoute(canvas, key, seg)) : segmentPolyline(canvas, seg);
       for (let i = 1; i < poly.length; i++) {
         const t = intersect(p, q, poly[i - 1], poly[i]);
         if (t === null || (best && t >= best.t)) continue;
@@ -1059,7 +1299,7 @@ function drawTies(canvas, ctx, graph) {
     const h = tieHalfLength(canvas, tie);
     ctx.save();
     ctx.translate(tie.pos[0], tie.pos[1]);
-    ctx.rotate(tie.angle ?? 0);
+    ctx.rotate(tieAngle(tie));
     ctx.fillStyle = tieColor(tie);
     ctx.strokeStyle = cutting ? CUT_RED : selected || active ? "#ffffff" : "rgba(0,0,0,0.6)";
     ctx.lineWidth = cutting || selected ? 2 : active ? 1.5 : 1;
@@ -1091,6 +1331,45 @@ function tieVisible(canvas, tie) {
   return tie.pos[0] >= area[0] - m && tie.pos[0] <= area[0] + area[2] + m && tie.pos[1] >= area[1] - m && tie.pos[1] <= area[1] + area[3] + m;
 }
 
+function renderGridLink(canvas, original, ctx, seg, link, skipBorder, flow, color, opts) {
+  const linkRenderer = canvas.linkRenderer;
+  const renderer = linkRenderer.pathRenderer;
+  const route = gridRoute(canvas, segmentKey(link, opts), seg);
+  const { points } = route;
+  const polyline = roundedGridPath(null, route);
+  const drawLinkPath = renderer.drawLinkPath;
+  const calculateCenterPoint = renderer.calculateCenterPoint;
+  const computeConnectionPoint = renderer.computeConnectionPoint;
+  const calculateLinkBounds = linkRenderer.calculateLinkBounds;
+  renderer.drawLinkPath = function (ctx, path, link, context, width, stroke) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = width;
+    roundedGridPath(path, route);
+    ctx.stroke(path);
+  };
+  renderer.calculateCenterPoint = function (link) {
+    link.centerPos = pointOnGrid(polyline, 0.5);
+    const after = pointOnGrid(polyline, 0.51);
+    link.centerAngle = Math.atan2(after.y - link.centerPos.y, after.x - link.centerPos.x);
+  };
+  renderer.computeConnectionPoint = function (_link, t) {
+    return pointOnGrid(polyline, t);
+  };
+  linkRenderer.calculateLinkBounds = function () {
+    const xs = points.map((p) => p[0]), ys = points.map((p) => p[1]);
+    const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+    return { x: minX - 20, y: minY - 20, width: maxX - minX + 40, height: maxY - minY + 40 };
+  };
+  try {
+    return original.call(canvas, ctx, seg.a, seg.b, link, skipBorder, flow, color, seg.sd, seg.ed, opts);
+  } finally {
+    renderer.drawLinkPath = drawLinkPath;
+    renderer.calculateCenterPoint = calculateCenterPoint;
+    renderer.computeConnectionPoint = computeConnectionPoint;
+    linkRenderer.calculateLinkBounds = calculateLinkBounds;
+  }
+}
+
 function installRendering(canvas) {
   const proto = Object.getPrototypeOf(canvas);
   const origRenderLink = proto.renderLink;
@@ -1101,11 +1380,26 @@ function installRendering(canvas) {
     if (state.rendering || !link || this.graph !== canvas.graph) return origRenderLink.apply(this, arguments);
     state.rendered = true;
     const key = segmentKey(link, opts);
-    if (key == null) return origRenderLink.apply(this, arguments);
     const seg = { a: [a[0], a[1]], b: [b[0], b[1]], sd, ed, startControl: opts.startControl, endControl: opts.endControl };
-    state.endpoints.set(key, seg);
+    if (setting(ROUTING_SETTING, "Default") === GRID_ROUTING) {
+      if (sd !== DIR.CENTER && !opts.startControl) {
+        const bounds = endpointNode(this.graph, link.origin_id)?.boundingRect;
+        if (bounds) seg.sourceBox = [...bounds];
+      }
+      if (ed !== DIR.CENTER && !opts.reroute) {
+        const bounds = endpointNode(this.graph, link.target_id)?.boundingRect;
+        if (bounds) seg.targetBox = [...bounds];
+      }
+    }
+    if (key != null) state.endpoints.set(key, seg);
     const previewed = state.preview?.keys.has(key);
     const ties = state.index.get(key);
+    if (setting(ROUTING_SETTING, "Default") === GRID_ROUTING) {
+      if (ties?.length) state.linkColors.set(key, color || link.color || this.constructor.link_type_colors?.[link.type] || this.default_link_color);
+      const active = previewed || ties?.some((t) => t.id === state.hovered || state.drag?.tie === t);
+      return renderGridLink(this, origRenderLink, ctx, seg, link, skipBorder, flow, color ?? (active ? PREVIEW_WHITE : null), opts);
+    }
+    if (key == null) return origRenderLink.apply(this, arguments);
     if (!ties?.length) {
       if (!previewed) return origRenderLink.apply(this, arguments);
       return origRenderLink.call(this, ctx, a, b, link, skipBorder, flow, PREVIEW_WHITE, sd, ed, opts);
@@ -1152,6 +1446,7 @@ function installRendering(canvas) {
     const graph = this.graph;
     if (this !== canvas || !graph) return origDrawConnections.call(this, ctx, ...rest);
     state.endpoints.clear();
+    state.tieDirection.clear();
     state.linkColors.clear();
     syncTies(graph);
     followMoves(this, graph);
@@ -1181,6 +1476,16 @@ app.registerExtension({
       type: "combo",
       options: KEYS,
       defaultValue: "Z",
+    },
+    {
+      id: ROUTING_SETTING,
+      category: ["Zip Ties", "Wires", "Routing"],
+      name: "Wire routing",
+      tooltip: "Draw all wires along horizontal and vertical runs with rounded corners. Ties use the nearest right angle while this mode is on.",
+      type: "combo",
+      options: ["Default", GRID_ROUTING],
+      defaultValue: "Default",
+      onChange: () => app.canvas?.setDirty(true, true),
     },
   ],
   getCanvasMenuItems() {

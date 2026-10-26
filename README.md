@@ -26,6 +26,9 @@ Each new tie gets a random cable-tie colour. The setting **Zip Ties → Colour o
 
 The wires keep their colours and run side by side between ties. Hovering or dragging a tie highlights every wire in it. A wire can pass through several ties. Rotating a tie turns the direction the wires take through it, so two ties at 0° and 90° make a right-angle bend.
 
+**Zip Ties → Wire routing** can draw both tied and untied wires as horizontal and vertical runs with rounded 90° corners. Bundled wires take nested bends, with a wider curve on the outside. Free trunk positions follow the canvas grid; wire ends and tie strands stay at their exact positions. The default keeps ComfyUI's usual link shape. In **Rounded grid** mode, ties appear at the nearest 90° angle; switching back restores their saved angles.
+When a wire returns toward a node on its left, the return run goes above or below its connected nodes, choosing the side toward the input when possible.
+
 Wires that pass through reroutes can be tied too. A tie holds the piece of wire it was drawn across: the piece between two reroutes, between an output and a reroute, or between the last reroute and the input. A piece that ends at a reroute is shared by every wire through that reroute.
 
 A tie moves along when you move every node and reroute its wires connect, for example a whole selection. Moving only some of them leaves the tie where it is, the same as a reroute. A tie inside a group moves with the group when you drag the group; Ctrl/Cmd-dragging a group moves only its frame, and the ties stay put like the nodes do. Selected ties move with the selected nodes, and Delete removes selected nodes and ties in one step that one undo brings back. A wire that is disconnected and connected again between the same two slots stays in its ties. A deleted wire, or one connected to a different slot, leaves its ties, and a tie with no wires left disappears.
@@ -55,18 +58,18 @@ The extension adds no nodes and has no Python dependencies.
 
 The extension is one file, `web/zip_ties.js`. It wraps these litegraph methods on the canvas:
 
-- `renderLink`: records where each wire piece starts and ends, and when a piece belongs to a tie it redraws it as several segments that pass through the tie, each strand offset sideways from the tie centre. Segment drawing is delegated to ComfyUI's own link renderer, so colours, borders and highlight behaviour come along for free.
+- `renderLink`: records where each wire piece starts and ends. In the default mode, tied pieces are redrawn as several segments through the tie. Rounded grid mode routes every piece through orthogonal runs and replaces the renderer's path during that draw, so the visible shape and link hit path match. Drawing still uses ComfyUI's link renderer for colours, borders and highlights.
 - `_renderAllLinkSegments`: litegraph skips a wire when both its ends are off screen, so the extension draws a tied wire anyway when one of its ties is on screen.
 - `drawConnections`: prunes ties whose wires are gone and moves ties that should follow a moved group, the dragged selection, or nodes and reroutes that all moved together, then draws the ties on top of the wires.
 - `deselectAll`, `handleLiveSelect`, `_handleMultiSelect` and `deleteSelected`: ties take part in clearing, box-selecting and deleting the canvas selection.
 - `_serializeItems` and `_deserializeItems`: copy adds the ties to the clipboard data, and paste maps them onto the new wires inside the same undo step.
 
-The drag gesture runs in capture-phase listeners on `window`, so it sees pointer events before litegraph and can claim them when the key is held or a tie is hit. The line is tested against each wire's bezier curve. When a new tie's wires all already belong to another tie, it copies that tie's strand order so wires never cross inside the bundle.
+The drag gesture runs in capture-phase listeners on `window`, so it sees pointer events before litegraph and can claim them when the key is held or a tie is hit. The line is tested against each wire's drawn route. When a new tie's wires all already belong to another tie, it copies that tie's strand order so wires never cross inside the bundle.
 
 ## Limits
 
 - A reroute piece that is drawn from a link badge (the hidden-link shortcut) cannot be tied.
-- The ribbon shape is tuned for spline links. Straight and linear link modes still route through the ties, but the cut test treats each segment as a straight line.
+- The default ribbon shape is tuned for spline links. Straight and linear link modes still route through the ties, but the cut test treats each segment as a straight line. Rounded grid mode uses its own shape in every link mode.
 - Tested on ComfyUI 0.42.0 with frontend 1.57.1, in both the classic canvas and Vue nodes mode.
 
 ## License
